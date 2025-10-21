@@ -1,9 +1,17 @@
-﻿flask
-gunicorn
-python-dotenv
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-google-api-python-client
-requests
-google-generativeai
+﻿# Core dependencies
+requests==2.31.0
+python-dotenv==1.0.1
+
+# Gmail / Google API
+google-api-python-client==2.143.0
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+
+# AI / Gemini
+google-generativeai==0.7.2
+
+# Web server (for Render)
+gunicorn==23.0.0
+
+# Optional helper libs
+flask==3.0.3
