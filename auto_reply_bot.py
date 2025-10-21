@@ -1,110 +1,93 @@
-import base64
-import time
-import sys
-import logging
-import threading
+from flask import Flask, request, jsonify
 import os
-from email.mime.text import MIMEText
-from flask import Flask
-from googleapiclient.discovery import build
+import base64
+from email.message import EmailMessage
 from google.oauth2.credentials import Credentials
-import google.generativeai as genai
+from googleapiclient.discovery import build
+from dotenv import load_dotenv
+from datetime import datetime
 
-# === CONFIGURE LOGGING (so Render shows output) ===
-logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
-print = lambda *args, **kwargs: logging.info(" ".join(map(str, args)))
+# Load environment variables
+load_dotenv()
 
-# === CONFIGURE GEMINI ===
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDEUcW7ml4iq88umeQRWGS_C0QCuyuBn30")
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-pro")
-
-def generate_ai_reply(email_text):
-    prompt = f"""
-    You are an intelligent email assistant. 
-    Read the following email and generate a short, polite, helpful, and natural reply.
-    If the email contains a question, try to answer it concisely.
-    Keep the tone friendly and professional.
-
-    EMAIL CONTENT:
-    {email_text}
-
-    Your reply:
-    """
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        print("⚠️ AI generation error:", e)
-        return "Hello! Thanks for reaching out. We’ll get back to you soon."
-
-def check_and_reply():
-    try:
-        creds = Credentials.from_authorized_user_file('token.json')
-        service = build('gmail', 'v1', credentials=creds)
-
-        print("🔍 Checking for unread emails...")
-        results = service.users().messages().list(userId='me', q='is:unread').execute()
-        messages = results.get('messages', [])
-        print(f"📨 Found {len(messages)} unread email(s).")
-
-        if not messages:
-            print("📭 No new emails.")
-            return
-
-        for msg in messages:
-            msg_id = msg['id']
-            message = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
-            headers = message['payload']['headers']
-            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '(no subject)')
-            sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
-            snippet = message.get('snippet', '')
-
-            print(f"📩 New email from {sender} | Subject: {subject}")
-            print("🧠 Generating AI reply...")
-
-            ai_reply = generate_ai_reply(snippet)
-
-            reply = MIMEText(ai_reply)
-            reply['To'] = sender
-            reply['Subject'] = f"Re: {subject}"
-
-            raw_reply = base64.urlsafe_b64encode(reply.as_bytes()).decode()
-            service.users().messages().send(userId="me", body={'raw': raw_reply}).execute()
-
-            # Mark as read
-            service.users().messages().modify(
-                userId='me',
-                id=msg_id,
-                body={'removeLabelIds': ['UNREAD']}
-            ).execute()
-
-            print("✅ Smart AI reply sent!\n")
-
-    except Exception as e:
-        print("❌ Error in check_and_reply:", e)
-
-# === KEEP RENDER SERVICE ALIVE ===
 app = Flask(__name__)
 
-@app.route('/')
+# Gmail API scope
+SCOPES = ['https://www.googleapis.com/auth/gmail.send']
+
+# In-memory log of sent emails
+SENT_EMAILS = []
+
+@app.route("/send-email", methods=["POST"])
+def send_email():
+    data = request.get_json()
+
+    # Validate input
+    if not data or not all(k in data for k in ("to", "subject", "body")):
+        return jsonify({"error": "Missing fields"}), 400
+
+    try:
+        # Load Gmail credentials
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        service = build('gmail', 'v1', credentials=creds)
+
+        # Build email
+        message = EmailMessage()
+        message.set_content(data["body"])
+        message["To"] = data["to"]
+        message["Subject"] = data["subject"]
+        sender = os.getenv("EMAIL_ADDRESS") or "atbusiness4110@gmail.com"
+        message["From"] = sender
+
+        # Encode and send
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        send_message = service.users().messages().send(
+            userId="me", body={"raw": encoded_message}
+        ).execute()
+
+        # Log the email
+        email_entry = {
+            "name": data.get("name", "Unknown"),
+            "email": data["to"],
+            "details": f"Subject: {data['subject']} | Body: {data['body'][:100]}...",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        SENT_EMAILS.append(email_entry)
+        print(f"✅ Sent email logged: {email_entry}")
+
+        return jsonify({"status": "success", "message_id": send_message["id"]}), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/emails", methods=["GET"])
+def get_emails():
+    """Return all sent emails."""
+    return jsonify(SENT_EMAILS), 200
+
+
+@app.route("/summary", methods=["GET"])
+def summary():
+    """Return a simple summary of sent emails."""
+    total = len(SENT_EMAILS)
+    if total == 0:
+        return "No emails sent yet."
+    urgent = sum("urgent" in e["details"].lower() for e in SENT_EMAILS)
+    latest = SENT_EMAILS[-1]["timestamp"]
+    return f"{total} emails sent. {urgent} marked urgent. Last email at {latest}."
+
+
+@app.route("/")
 def home():
-    return "✅ Email Auto-Reply Bot is running on Render!"
+    return jsonify({
+        "status": "running",
+        "message": "🤖 Email Bot is live and connected!",
+        "emails_endpoint": "/emails",
+        "summary_endpoint": "/summary"
+    })
 
-@app.route('/health')
-def health():
-    return "OK", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
-def start_bot_loop():
-    print("🤖 Smart auto-reply bot started! Checking inbox every 30 seconds...")
-    while True:
-        check_and_reply()
-        time.sleep(30)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    start_bot_loop()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
