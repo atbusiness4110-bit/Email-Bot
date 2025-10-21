@@ -1,132 +1,114 @@
-from flask import Flask, request, jsonify
-import os
 import base64
-import time 
-import requests
-from email.message import EmailMessage
-from google.oauth2.credentials import Credentials
+import time
+import sys
+import logging
+import threading
+import os
+from email.mime.text import MIMEText
+from flask import Flask
 from googleapiclient.discovery import build
-from dotenv import load_dotenv
-import email
+from google.oauth2.credentials import Credentials
+import google.generativeai as genai
 
-# ===============================
-# 🔹 LOAD CONFIGURATION
-# ===============================
-load_dotenv()
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+# === CONFIGURE LOGGING (so Render shows output) ===
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
+print = lambda *args, **kwargs: logging.info(" ".join(map(str, args)))
 
-RENDER_SERVER = os.getenv("RENDER_SERVER") or "https://email-bot-free.onrender.com"
-BOT_EMAIL = os.getenv("EMAIL_ADDRESS") or "atbusiness4110@gmail.com"
+# === CONFIGURE GEMINI ===
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDEUcW7ml4iq88umeQRWGS_C0QCuyuBn30")
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-2.5-pro")
 
-# ===============================
-# 🔹 FLASK APP (for local testing)
-# ===============================
+def generate_ai_reply(email_text):
+    prompt = f"""
+    You are an intelligent email assistant. 
+    Read the following email and generate a short, polite, helpful, and natural reply.
+    If the email contains a question, try to answer it concisely.
+    Keep the tone friendly and professional.
+
+    EMAIL CONTENT:
+    {email_text}
+
+    Your reply:
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print("⚠️ AI generation error:", e)
+        return "Hello! Thanks for reaching out. We’ll get back to you soon."
+
+def check_and_reply():
+    try:
+        creds = Credentials.from_authorized_user_file('token.json')
+        service = build('gmail', 'v1', credentials=creds)
+
+        print("🔍 Checking for unread emails...")
+        results = service.users().messages().list(userId='me', q='is:unread').execute()
+        messages = results.get('messages', [])
+        print(f"📨 Found {len(messages)} unread email(s).")
+
+        if not messages:
+            print("📭 No new emails.")
+            return
+
+        for msg in messages:
+            msg_id = msg['id']
+            message = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
+            headers = message['payload']['headers']
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '(no subject)')
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+            snippet = message.get('snippet', '')
+
+            print(f"📩 New email from {sender} | Subject: {subject}")
+            print("🧠 Generating AI reply...")
+
+            ai_reply = generate_ai_reply(snippet)
+
+            reply = MIMEText(ai_reply)
+            reply['To'] = sender
+            reply['Subject'] = f"Re: {subject}"
+
+            raw_reply = base64.urlsafe_b64encode(reply.as_bytes()).decode()
+            service.users().messages().send(userId="me", body={'raw': raw_reply}).execute()
+
+            # Mark as read
+            service.users().messages().modify(
+                userId='me',
+                id=msg_id,
+                body={'removeLabelIds': ['UNREAD']}
+            ).execute()
+
+            print("✅ Smart AI reply sent!\n")
+
+    except Exception as e:
+        print("❌ Error in check_and_reply:", e)
+
+# === KEEP RENDER SERVICE ALIVE ===
 app = Flask(__name__)
 
-@app.route("/")
+@app.route('/')
 def home():
-    return jsonify({"status": "running", "message": "🤖 Email Bot local app is live!"})
+    return "✅ Email Auto-Reply Bot is running on Render!"
 
-# ===============================
-# 🔹 SEND EMAIL THROUGH GMAIL API
-# ===============================
-def send_email(to, subject, body):
-    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    service = build('gmail', 'v1', credentials=creds)
+@app.route('/health')
+def health():
+    return "OK", 200
 
-    msg = EmailMessage()
-    msg.set_content(body)
-    msg["To"] = to
-    msg["From"] = BOT_EMAIL
-    msg["Subject"] = subject
-
-    encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    sent = service.users().messages().send(userId="me", body={"raw": encoded}).execute()
-    print(f"✅ Sent email to {to} (ID: {sent['id']})")
-
-    # Log to render server
-    try:
-        requests.post(f"{RENDER_SERVER}/send-email", json={
-            "to": to,
-            "subject": subject,
-            "body": body
-        })
-    except Exception as e:
-        print(f"⚠️ Could not send log to server: {e}")
-
-# ===============================
-# 🔹 CHECK FOR NEW EMAILS
-# ===============================
-def check_for_new_messages():
-    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    service = build('gmail', 'v1', credentials=creds)
-
-    results = service.users().messages().list(userId='me', labelIds=['INBOX', 'UNREAD']).execute()
-    messages = results.get('messages', [])
-
-    if not messages:
-        return None
-
-    for msg in messages:
-        msg_id = msg['id']
-        m = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
-        headers = m['payload']['headers']
-
-        sender = next((h['value'] for h in headers if h['name'] == 'From'), None)
-        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "(no subject)")
-
-        # Extract body text
-        parts = m['payload'].get('parts', [])
-        body_text = ""
-        if parts:
-            for part in parts:
-                if part['mimeType'] == 'text/plain':
-                    body_text = base64.urlsafe_b64decode(part['body']['data']).decode()
-        else:
-            body_text = base64.urlsafe_b64decode(m['payload']['body']['data']).decode()
-
-        # Mark as read
-        service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-
-        print(f"📨 New email from {sender} — Subject: {subject}")
-        return sender, subject, body_text
-
-    return None
-
-# ===============================
-# 🔹 AUTO-REPLY LOGIC LOOP
-# ===============================
-def auto_reply_loop():
-    print("🤖 Email Auto-Responder started...")
-    while True:
-        try:
-            new_mail = check_for_new_messages()
-            if new_mail:
-                sender, subject, body = new_mail
-
-                reply_msg = (
-                    f"Hello,\n\n"
-                    f"Thank you for your message regarding '{subject}'. "
-                    f"This is an automated response from the Email Bot.\n\n"
-                    f"Original message:\n{body}\n\n"
-                    f"Best regards,\nAI Email Bot"
-                )
-
-                send_email(sender, f"Re: {subject}", reply_msg)
-            else:
-                print("📭 No new messages. Checking again in 30s...")
-
-            time.sleep(30)
-        except Exception as e:
-            print(f"⚠️ Error in loop: {e}")
-            time.sleep(30)
-
-# ===============================
-# 🔹 MAIN RUN
-# ===============================
+# === RUN BOTH FLASK + EMAIL LOOP ===
 if __name__ == "__main__":
-    from threading import Thread
+    def run_flask():
+        port = int(os.environ.get("PORT", 5000))
+        app.run(host="0.0.0.0", port=port)
 
-    # Run Flask app and auto-reply loop simultaneously
-    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))).start()
-    auto_reply_loop()
+    def run_email_bot():
+        print("🤖 Smart auto-reply bot started! Checking inbox every 30 seconds...")
+        while True:
+            try:
+                check_and_reply()
+            except Exception as e:
+                print("⚠️ Error in email loop:", e)
+            time.sleep(30)
+
+    threading.Thread(target=run_flask, daemon=True).start()
+    run_email_bot()
