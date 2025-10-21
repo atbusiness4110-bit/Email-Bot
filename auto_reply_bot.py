@@ -4,6 +4,9 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from email.mime.text import MIMEText
 import google.generativeai as genai
+from flask import Flask
+import threading
+import os
 
 # === CONFIGURE GEMINI ===
 GEMINI_API_KEY = "AIzaSyDEUcW7ml4iq88umeQRWGS_C0QCuyuBn30"
@@ -71,7 +74,25 @@ def check_and_reply():
 
         print("✅ Smart AI reply sent!\n")
 
+# === KEEP RENDER SERVICE ALIVE ===
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ Email Auto-Reply Bot is running on Render!"
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
 if __name__ == "__main__":
+    # Start Flask server in background thread
+    threading.Thread(target=run_flask, daemon=True).start()
+
     print("🤖 Smart auto-reply bot started! Checking inbox every 30 seconds...")
     while True:
         check_and_reply()
